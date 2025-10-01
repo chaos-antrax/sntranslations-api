@@ -2,13 +2,16 @@
 # .\venv\Scripts\Activate
 # uvicorn ex-nov-dtl-api:app --host 0.0.0.0 --port 8000 --reload
 
-from fastapi import FastAPI, Query, Body, HTTPException
-from fastapi.responses import JSONResponse
+import logging
+from fastapi import FastAPI, Query, Body, HTTPException, Request
+from fastapi.responses import JSONResponse, StreamingResponse
 from playwright.sync_api import sync_playwright
 from urllib.parse import urljoin
 from pydantic import BaseModel
 from openai import OpenAI
-from typing import Dict, Any
+from typing import Dict, Any, Optional
+from pymongo import MongoClient
+from bson import ObjectId
 import time
 import uvicorn
 import json
@@ -184,39 +187,50 @@ def extract_single_chapter(chapter_url: str, headless: bool = True):
 # -----------------------------
 # CONFIG
 # -----------------------------
-OPENROUTER_API_KEY = "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"
-TRANSLATION_FOLDER = "translations"
-GLOSSARY_FILE = os.path.join(TRANSLATION_FOLDER, "glossary.json")
+OPENROUTER_API_KEY = "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"
+MONGODB_URI = "mongodb+srv://hasithajagoda2410:pUHv7Is76JI5s5HF@cluster0.9jl4qec.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
+
+# Initialize MongoDB client
+mongo_client = MongoClient(MONGODB_URI)
+db = mongo_client["novel-reader"]
+
 
 # -----------------------------
 # HELPER FUNCTIONS
 # -----------------------------
-def load_glossary() -> Dict[str, str]:
-    """Load glossary from JSON file, create if it doesn't exist."""
-    os.makedirs(TRANSLATION_FOLDER, exist_ok=True)
-
-    if os.path.exists(GLOSSARY_FILE):
-        try:
-            with open(GLOSSARY_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except (json.JSONDecodeError, FileNotFoundError):
-            print("Glossary file corrupted. Reinitializing.")
-            with open(GLOSSARY_FILE, "w", encoding="utf-8") as f:
-                json.dump({}, f, ensure_ascii=False, indent=2)
-            return {}
-    else:
-        with open(GLOSSARY_FILE, "w", encoding="utf-8") as f:
-            json.dump({}, f, ensure_ascii=False, indent=2)
+def get_novel_glossary(novel_id: str) -> Dict[str, str]:
+    """Get glossary for a specific novel from MongoDB."""
+    try:
+        novel = db.novels.find_one({"_id": ObjectId(novel_id)})
+        if novel and "glossary" in novel:
+            return novel["glossary"]
+        return {}
+    except Exception as e:
+        print(f"Error fetching glossary for novel {novel_id}: {e}")
         return {}
 
-def save_glossary(glossary: Dict[str, str]):
-    """Save glossary back to file."""
-    os.makedirs(TRANSLATION_FOLDER, exist_ok=True)
-    with open(GLOSSARY_FILE, "w", encoding="utf-8") as f:
-        json.dump(glossary, f, ensure_ascii=False, indent=2)
+def update_novel_glossary(novel_id: str, new_terms: Dict[str, str]) -> bool:
+    """Update novel's glossary with new terms in MongoDB."""
+    try:
+        # Get current glossary
+        current_glossary = get_novel_glossary(novel_id)
+        
+        # Merge with new terms (new terms take precedence)
+        updated_glossary = {**current_glossary, **new_terms}
+        
+        # Update in database
+        result = db.novels.update_one(
+            {"_id": ObjectId(novel_id)},
+            {"$set": {"glossary": updated_glossary}}
+        )
+        
+        return result.modified_count > 0
+    except Exception as e:
+        print(f"Error updating glossary for novel {novel_id}: {e}")
+        return False
 
-def translate_text_openrouter(text: str, glossary: Dict[str, str]):
-    """Translate Chinese text to English using OpenRouter + DeepSeek."""
+def translate_text_openrouter(text: str, chapter_name: str, glossary: Dict[str, str]):
+    """Translate Chinese text and chapter name to English using OpenRouter + DeepSeek."""
     client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=OPENROUTER_API_KEY)
 
     # glossary context
@@ -230,20 +244,25 @@ def translate_text_openrouter(text: str, glossary: Dict[str, str]):
     # system prompt
     system_prompt = """You are a professional translator from Chinese to English.
     Follow these rules:
-    1. Translate the text naturally while preserving the original meaning.
+    1. Translate both the chapter title and content naturally while preserving the original meaning.
     2. For proper nouns (names, places, items, etc.), use the provided glossary if available.
-    3. If you encounter a Chinese proper noun not in the glossary, add it to the new terms list.
+    3. If you encounter a Chinese proper noun or name of certain cultivation realms not in the glossary, add it to the new terms list.
     4. Format your response EXACTLY as follows:
-    TRANSLATION: [your translation text here. The first line in the translation should be the chapter number and title if available.]
-    NEW TERMS: [chinese:english, chinese:english, chinese:english]
+    CHAPTER_TITLE: [translated chapter title here]
+    TRANSLATION: [your translation text here]
+    NEW_TERMS: [chinese:english, chinese:english, chinese:english]
 
-    Each term should be on a separate line in the NEW TERMS section.
+    Each term should be on a separate line in the NEW_TERMS section.
     Only include one term per line in the format "chinese:english"."""
 
-    user_prompt = f"{glossary_context}Translate the following text:\n\n{text}"
+    user_prompt = f"""{glossary_context}Chapter Title: {chapter_name}
+
+Chapter Content:
+{text}
+
+Please translate both the chapter title and content."""
 
     response = client.chat.completions.create(
-        # model="deepseek/deepseek-chat-v3.1:free",
         model="x-ai/grok-4-fast:free",
         messages=[
             {"role": "system", "content": system_prompt},
@@ -253,12 +272,18 @@ def translate_text_openrouter(text: str, glossary: Dict[str, str]):
 
     response_text = response.choices[0].message.content
 
-    # extract translation and terms
-    translation_match = re.search(
-        r"TRANSLATION:\s*(.*?)(?=NEW TERMS:|$)", response_text, re.DOTALL
+    # extract chapter title, translation and terms
+    chapter_title_match = re.search(
+        r"CHAPTER_TITLE:\s*(.*?)(?=TRANSLATION:|$)", response_text, re.DOTALL
     )
-    new_terms_match = re.search(r"NEW TERMS:\s*([\s\S]*)", response_text)
+    translation_match = re.search(
+        r"TRANSLATION:\s*(.*?)(?=NEW_TERMS:|$)", response_text, re.DOTALL
+    )
+    new_terms_match = re.search(r"NEW_TERMS:\s*([\s\S]*)", response_text)
 
+    chapter_title = (
+        chapter_title_match.group(1).strip() if chapter_title_match else chapter_name
+    )
     translation = (
         translation_match.group(1).strip() if translation_match else response_text
     )
@@ -272,14 +297,23 @@ def translate_text_openrouter(text: str, glossary: Dict[str, str]):
                 if chinese and english:
                     new_terms[chinese] = english
 
-    return translation, new_terms
+    return chapter_title, translation, new_terms
 
 class TranslateRequest(BaseModel):
     text: str
+    chapter_name: str
+    novel_id: str
+
+
+
+
+# configure logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 # routes
 @app.get("/scrape")
 def scrape(url: str = Query(..., description="Novel URL (e.g., https://twkan.com/book/79291)")):
+    logging.info(f"[SCRAPE] Started scraping for URL: {url}")
     url = url.rstrip('/')
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=False)  # headless for API
@@ -288,6 +322,7 @@ def scrape(url: str = Query(..., description="Novel URL (e.g., https://twkan.com
             page.goto(url, wait_until='domcontentloaded')
             novel_details = get_novel_details(page, url)
             if not novel_details:
+                logging.info(f"[SCRAPE] Failed for URL: {url}")
                 return JSONResponse(content={"error": "Failed to extract novel details"}, status_code=400)
 
             clean_base_url = url[:-5] if url.endswith('.html') else url
@@ -295,6 +330,7 @@ def scrape(url: str = Query(..., description="Novel URL (e.g., https://twkan.com
             chapters = crawl_chapters(page, index_url)
 
             if not chapters:
+                logging.info(f"[SCRAPE] Failed (no chapters) for URL: {url}")
                 return JSONResponse(content={"error": "Failed to crawl chapters"}, status_code=400)
 
             result = {
@@ -304,45 +340,63 @@ def scrape(url: str = Query(..., description="Novel URL (e.g., https://twkan.com
                 'chapters': chapters
             }
 
+            logging.info(f"[SCRAPE] Completed for URL: {url}")
             return JSONResponse(content=result, status_code=200)
 
         except Exception as e:
+            logging.error(f"[SCRAPE] Error for URL {url}: {e}")
             return JSONResponse(content={"error": str(e)}, status_code=500)
         finally:
             browser.close()
 
+
 @app.get("/extract")
 def extract(url: str = Query(..., description="Chapter URL"), headless: bool = True):
-    """Extract chapter content from a given URL"""
+    logging.info(f"[EXTRACT] Started extraction for: {url}")
     try:
         content = extract_single_chapter(url, headless=headless)
         if content:
+            logging.info(f"[EXTRACT] Completed successfully for: {url}")
             return JSONResponse(content={"success": True, "content": content})
         else:
+            logging.info(f"[EXTRACT] Failed (no content) for: {url}")
             return JSONResponse(content={"success": False, "error": "Failed to extract content"}, status_code=400)
     except Exception as e:
+        logging.error(f"[EXTRACT] Error for URL {url}: {e}")
         return JSONResponse(content={"success": False, "error": str(e)}, status_code=500)
-    
+
+
 @app.post("/translate")
 def translate_endpoint(payload: TranslateRequest = Body(...)) -> Dict[str, Any]:
+    logging.info(f"[TRANSLATE] Started translation for Novel ID: {payload.novel_id}, Chapter: {payload.chapter_name}")
+
     text = payload.text.strip()
+    chapter_name = payload.chapter_name.strip()
+    novel_id = payload.novel_id.strip()
+    
     if not text:
         raise HTTPException(status_code=400, detail="Text cannot be empty")
+    if not chapter_name:
+        raise HTTPException(status_code=400, detail="Chapter name cannot be empty")
+    if not novel_id:
+        raise HTTPException(status_code=400, detail="Novel ID cannot be empty")
 
-    glossary = load_glossary()
-    translation, new_terms = translate_text_openrouter(text, glossary)
+    glossary = get_novel_glossary(novel_id)
+    chapter_title, translation, new_terms = translate_text_openrouter(text, chapter_name, glossary)
 
-    # update glossary with new terms
     added = 0
-    for chinese, english in new_terms.items():
-        if chinese not in glossary:
-            glossary[chinese] = english
-            added += 1
-    if added > 0:
-        save_glossary(glossary)
+    if new_terms:
+        success = update_novel_glossary(novel_id, new_terms)
+        if success:
+            added = len(new_terms)
+            glossary = get_novel_glossary(novel_id)
+
+    logging.info(f"[TRANSLATE] Completed translation for Novel ID: {novel_id}, Chapter: {chapter_name} (Added {added} new terms)")
 
     return {
+        "chapter_title": chapter_title,
         "translation": translation,
         "new_terms": new_terms,
         "glossary": glossary,
+        "terms_added": added
     }
