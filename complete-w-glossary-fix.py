@@ -187,9 +187,8 @@ def extract_single_chapter(chapter_url: str, headless: bool = True):
 # -----------------------------
 # CONFIG
 # -----------------------------
-OPENROUTER_API_KEY = "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"
-# OPENROUTER_API_KEY = "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" jagodahasitha
-MONGODB_URI = "mongodb+srv://hasithajagoda2410:pUHv7Is76JI5s5HF@cluster0.9jl4qec.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
+OPENROUTER_API_KEY = ""
+MONGODB_URI = ""
 
 # Initialize MongoDB client
 mongo_client = MongoClient(MONGODB_URI)
@@ -351,7 +350,6 @@ Chapter Content:
 Please translate both the chapter title and content."""
 
     response = client.chat.completions.create(
-        # model="tngtech/deepseek-r1t2-chimera:free",
         model="tngtech/deepseek-r1t2-chimera:free",
         messages=[
             {"role": "system", "content": system_prompt},
